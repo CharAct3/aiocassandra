@@ -2,8 +2,10 @@ import uuid
 
 import pytest
 from cassandra.cqlengine import columns
+from cassandra.cqlengine.query import BatchQuery
 
 from aiocassandra import AioModel
+from aiocassandra.cqlengine.query import AioBatchQuery
 
 
 class User(AioModel):
@@ -72,3 +74,17 @@ async def test_model_async_functions(cqlengine_management):
     # test: obj.async_delete()
     await user.async_delete()
     assert len(await User.objects.async_all()) == 0
+
+
+@pytest.mark.asyncio
+async def test_batch_query_async_execute(cqlengine_management):
+    cqlengine_management.sync_table(User)
+    batch_query = AioBatchQuery()
+    User.batch(batch_query).create(user_id=uuid.uuid4(), username="user-1")
+    User.batch(batch_query).create(user_id=uuid.uuid4(), username="user-2")
+    User.batch(batch_query).create(user_id=uuid.uuid4(), username="user-3")
+    await batch_query.async_execute()
+
+    users = await User.async_all()
+    username_set = {user.username for user in users}
+    assert username_set == {"user-1", "user-2", "user-3"}

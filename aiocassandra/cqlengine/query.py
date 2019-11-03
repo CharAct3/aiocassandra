@@ -1,11 +1,14 @@
 """
 Patch cqlengine, add async functions.
 """
+from datetime import datetime, timedelta
 from warnings import warn
+import time
 
+import six
 from cassandra.cqlengine.query import (DMLQuery, ModelQuerySet, check_applied,
                                        SimpleStatement, conn, ValidationError,
-                                       EqualsOperator)
+                                       EqualsOperator, BatchQuery)
 from cassandra.cqlengine import CQLEngineException
 from cassandra.cqlengine import columns
 from cassandra.cqlengine.statements import (UpdateStatement, DeleteStatement,
@@ -354,3 +357,60 @@ class AioQuerySet(ModelQuerySet):
                 conditionals=delete_conditional,
                 if_exists=self._if_exists)
             await self._async_execute(ds)
+
+
+class AioBatchQuery(BatchQuery):
+
+    async def async_execute(self):
+        if self._executed and self.warn_multiple_exec:
+            msg = "Batch executed multiple times."
+            if self._context_entered:
+                msg += " If using the batch as a context manager, " \
+                       "there is no need to call execute directly."
+            warn(msg)
+        self._executed = True
+
+        if len(self.queries) == 0:
+            # Empty batch is a no-op
+            # except for callbacks
+            self._execute_callbacks()
+            return
+
+        opener = 'BEGIN ' + (
+            self.batch_type + ' ' if self.batch_type else '') + ' BATCH'
+        if self.timestamp:
+
+            if isinstance(self.timestamp, six.integer_types):
+                ts = self.timestamp
+            elif isinstance(self.timestamp, (datetime, timedelta)):
+                ts = self.timestamp
+                if isinstance(self.timestamp, timedelta):
+                    ts += datetime.now()  # Apply timedelta
+                ts = int(time.mktime(ts.timetuple()) * 1e+6 + ts.microsecond)
+            else:
+                raise ValueError("Batch expects a long, a timedelta, "
+                                 "or a datetime")
+
+            opener += ' USING TIMESTAMP {0}'.format(ts)
+
+        query_list = [opener]
+        parameters = {}
+        ctx_counter = 0
+        for query in self.queries:
+            query.update_context_id(ctx_counter)
+            ctx = query.get_context()
+            ctx_counter += len(ctx)
+            query_list.append('  ' + str(query))
+            parameters.update(ctx)
+
+        query_list.append('APPLY BATCH;')
+
+        tmp = await execute('\n'.join(query_list),
+                            parameters,
+                            self._consistency,
+                            self._timeout,
+                            connection=self._connection)
+        check_applied(tmp)
+
+        self.queries = []
+        self._execute_callbacks()
